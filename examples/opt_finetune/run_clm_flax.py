@@ -748,7 +748,10 @@ def main():
                         .get_logical_mesh([data_parallel, operator_parallel]))
         return method
 
-    alpa.global_config.xla_client_mem_fraction = 0.93
+    def get_eval_step_input_specs():
+        input_specs = p_train_step.get_executable().get_input_placement_specs()
+        return input_specs[0].params, input_specs[1]
+
     method = get_3d_parallel_method(num_micro_batches=4,
                                     data_parallel=2,
                                     operator_parallel=4,
@@ -756,7 +759,7 @@ def main():
     p_train_step = alpa.parallelize(train_step,
                                     method=method,
                                     donate_argnums=(0,))
-    p_eval_step = alpa.parallelize(eval_step)
+    p_eval_step = alpa.parallelize(eval_step, method=alpa.FollowParallel(get_eval_step_input_specs))
 
     dump_debug_info_train_step = dump_debug_info_eval_step = True
 
