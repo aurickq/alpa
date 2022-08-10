@@ -829,12 +829,17 @@ class GradAccMeshWorkerExecutable(MeshWorkerExecutable):
         num_devices = np.prod(stage_plan.logical_mesh_shape)
         assert num_devices == len(worker.backend.devices())
 
+        import time
+        print("accumulate_grad begin", time.time())
         self.accumulate_grad = run_backend_compilation(worker.backend,
                                                        accumulate_grad_proto,
                                                        stage_plan, num_devices)
+        print("accumulate_grad end", time.time())
+        print("apply_grad begin", time.time())
         self.apply_grad = run_backend_compilation(worker.backend,
                                                   apply_grad_proto, stage_plan,
                                                   num_devices)
+        print("apply_grad end", time.time())
         self.allocate_zero_buffers = compile_allocate_zero_buffers(
             worker.backend, num_devices, grad_shard_shapes, grad_shard_dtypes)
         self.accumulate_grad_invar_indices = accumulate_grad_invar_indices

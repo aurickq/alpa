@@ -748,6 +748,7 @@ def main():
                         .get_logical_mesh([data_parallel, operator_parallel]))
         return method
 
+    alpa.global_config.xla_client_mem_fraction = 0.93
     method = get_3d_parallel_method(num_micro_batches=4,
                                     data_parallel=2,
                                     operator_parallel=4,
