@@ -737,7 +737,7 @@ def main():
                                pipeline_parallel):
         assert (data_parallel * operator_parallel * pipeline_parallel == 
                 alpa.get_global_num_devices())
-        assert pipeline_parallel == 1
+        assert pipeline_parallel == 1, "TODO(lmzheng): Will be added later."
 
         method = alpa.ShardParallel(
             num_micro_batches=num_micro_batches,
@@ -749,8 +749,8 @@ def main():
         return method
 
     method = get_3d_parallel_method(num_micro_batches=4,
-                                    data_parallel=1,
-                                    operator_parallel=8,
+                                    data_parallel=2,
+                                    operator_parallel=4,
                                     pipeline_parallel=1)
     p_train_step = alpa.parallelize(train_step,
                                     method=method,
@@ -905,7 +905,7 @@ def main():
             json.dump(eval_metrics, f, indent=4, sort_keys=True)
 
 
-def monkey_patch_remat();
+def monkey_patch_remat():
     # Use monkey patch to add remat for all transformer layers.
     from transformers.models.opt.modeling_flax_opt import FlaxOPTDecoderLayer, FlaxOPTDecoderLayerCollection
     from flax import linen as nn
