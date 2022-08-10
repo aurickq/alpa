@@ -97,6 +97,7 @@ class TrainingArguments:
     per_device_eval_batch_size: int = field(
         default=8, metadata={"help": "Batch size per GPU/TPU core/CPU for evaluation."}
     )
+    use_remat: bool = field(default=True, metadata={"help": "Whether or not to use gradient rematerilization/gradient checkpointing."})
     learning_rate: float = field(default=5e-5, metadata={"help": "The initial learning rate for AdamW."})
     weight_decay: float = field(default=0.0, metadata={"help": "Weight decay for AdamW if we apply some."})
     adam_beta1: float = field(default=0.9, metadata={"help": "Beta1 for AdamW optimizer"})
@@ -347,13 +348,9 @@ def main():
         level=logging.INFO,
     )
     # Setup logging, we only want one process per machine to log things on the screen.
-    logger.setLevel(logging.INFO if jax.process_index() == 0 else logging.ERROR)
-    if jax.process_index() == 0:
-        datasets.utils.logging.set_verbosity_warning()
-        transformers.utils.logging.set_verbosity_info()
-    else:
-        datasets.utils.logging.set_verbosity_error()
-        transformers.utils.logging.set_verbosity_error()
+    logger.setLevel(logging.INFO)
+    datasets.utils.logging.set_verbosity_warning()
+    transformers.utils.logging.set_verbosity_info()
 
     # Set the verbosity to info of the Transformers logger (on main process only):
     logger.info(f"Training/evaluation parameters {training_args}")
@@ -465,20 +462,8 @@ def main():
         config = CONFIG_MAPPING[model_args.model_type]()
         logger.warning("You are instantiating a new config instance from scratch.")
 
-    gradient_checkpointing = True
-    if gradient_checkpointing:
-        from transformers.models.opt.modeling_flax_opt import FlaxOPTDecoderLayer, FlaxOPTDecoderLayerCollection
-        from flax.linen.module import wrap_method_once
-
-        @wrap_method_once
-        def setup(self):
-            self.layers = [
-                trans_func(FlaxOPTDecoderLayer)(self.config, name=str(i), dtype=self.dtype)
-                for i in range(self.config.num_hidden_layers)
-            ]
-            self.layerdrop = self.config.layerdrop
-
-        setattr(FlaxOPTDecoderLayerCollection, "setup", setup)
+    if training_args.use_remat:
+        monkey_patch_remat()
 
     if model_args.tokenizer_name:
         tokenizer = AutoTokenizer.from_pretrained(
@@ -491,8 +476,9 @@ def main():
         tokenizer = AutoTokenizer.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=model_args.cache_dir,
-            use_fast=model_args.use_fast_tokenizer,
+            #use_fast=model_args.use_fast_tokenizer,
             use_auth_token=True if model_args.use_auth_token else None,
+            use_fast=False,
         )
     else:
         raise ValueError(
@@ -612,7 +598,7 @@ def main():
 
     # Enable tensorboard only on the master node
     has_tensorboard = is_tensorboard_available()
-    if has_tensorboard and jax.process_index() == 0:
+    if has_tensorboard:
         try:
             from flax.metrics.tensorboard import SummaryWriter
 
@@ -719,6 +705,7 @@ def main():
         new_state = state.apply_gradients(grads=grads)
 
         if dynamic_scale:
+            if_fin = True
             new_state = new_state.replace(
                 opt_state=jax.tree_map(
                     functools.partial(jnp.where, is_fin),
@@ -746,21 +733,25 @@ def main():
         return metrics
 
     # Create parallel version of the train and eval step
-    #method = alpa.PipeshardParallel(
-    #    num_micro_batches=4,
-    #    default_auto_sharding_option=alpa.AutoShardingOption(
-    #        prefer_reduce_scatter=True),
-    #    layer_option=AutoLayerOption(layer_num=2),
-    #    stage_option="uniform",
-    #)
+    def get_3d_parallel_method(num_micro_batches, data_parallel, operator_parallel,
+                               pipeline_parallel):
+        assert (data_parallel * operator_parallel * pipeline_parallel == 
+                alpa.get_global_num_devices())
+        assert pipeline_parallel == 1
 
-    method = alpa.ShardParallel(
-        num_micro_batches=4,
-        auto_sharding_option=alpa.AutoShardingOption(
-            prefer_reduce_scatter=True,
-            force_batch_dim_to_mesh_dim=0),
-        devices=alpa.get_global_physical_mesh(create_if_not_exist=True)
-                    .get_logical_mesh([8, 1]))
+        method = alpa.ShardParallel(
+            num_micro_batches=num_micro_batches,
+            auto_sharding_option=alpa.AutoShardingOption(
+                prefer_reduce_scatter=True,
+                force_batch_dim_to_mesh_dim=0),
+            devices=alpa.get_global_physical_mesh(create_if_not_exist=True)
+                        .get_logical_mesh([data_parallel, operator_parallel]))
+        return method
+
+    method = get_3d_parallel_method(num_micro_batches=4,
+                                    data_parallel=1,
+                                    operator_parallel=8,
+                                    pipeline_parallel=1)
     p_train_step = alpa.parallelize(train_step,
                                     method=method,
                                     donate_argnums=(0,))
@@ -771,7 +762,7 @@ def main():
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num Epochs = {num_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {training_args.per_device_train_batch_size}")
+    logger.info(f"  Batch size per device = {training_args.per_device_train_batch_size}")
     logger.info(f"  Total train batch size (w. parallel & distributed) = {train_batch_size}")
     logger.info(f"  Total optimization steps = {total_train_steps}")
 
@@ -807,7 +798,8 @@ def main():
                 executable = p_train_step.get_last_executable()
                 executable.sync()
                 executable.dump_debug_info("alpa_debug_info")
-                epochs.write('Initial compilation completed.')
+                epochs.write(f"Initial compilation completed. "
+                             f"Time elapsed: {time.time() - train_start:.2f} s")
 
             step_ct += 1
             if cur_step % training_args.logging_steps == 0 and cur_step > 0:
@@ -826,7 +818,7 @@ def main():
 
                 # Save metrics
                 train_time += time.time() - train_start
-                if has_tensorboard and jax.process_index() == 0:
+                if has_tensorboard:
                     write_train_metric(summary_writer, train_metrics, train_time, cur_step)
 
                 train_metric = jax.tree_map(np.mean, train_metric)
@@ -876,17 +868,16 @@ def main():
                 epochs.desc = desc
 
                 # Save metrics
-                if has_tensorboard and jax.process_index() == 0:
+                if has_tensorboard:
                     write_eval_metric(summary_writer, eval_metrics, cur_step)
 
             if cur_step % training_args.save_steps == 0 and cur_step > 0:
                 # save checkpoint after each epoch and push checkpoint to the hub
-                if jax.process_index() == 0:
-                    params = state.params
-                    model.save_pretrained(training_args.output_dir, params=params)
-                    tokenizer.save_pretrained(training_args.output_dir)
-                    if training_args.push_to_hub:
-                        repo.push_to_hub(commit_message=f"Saving weights and logs of step {cur_step}", blocking=False)
+                params = state.params
+                model.save_pretrained(training_args.output_dir, params=params)
+                tokenizer.save_pretrained(training_args.output_dir)
+                if training_args.push_to_hub:
+                    repo.push_to_hub(commit_message=f"Saving weights and logs of step {cur_step}", blocking=False)
 
     # Eval after training
     if training_args.do_eval:
@@ -908,11 +899,28 @@ def main():
         except OverflowError:
             eval_metrics["perplexity"] = float("inf")
 
-        if jax.process_index() == 0:
-            eval_metrics = {f"eval_{metric_name}": value for metric_name, value in eval_metrics.items()}
-            path = os.path.join(training_args.output_dir, "eval_results.json")
-            with open(path, "w") as f:
-                json.dump(eval_metrics, f, indent=4, sort_keys=True)
+        eval_metrics = {f"eval_{metric_name}": value for metric_name, value in eval_metrics.items()}
+        path = os.path.join(training_args.output_dir, "eval_results.json")
+        with open(path, "w") as f:
+            json.dump(eval_metrics, f, indent=4, sort_keys=True)
+
+
+def monkey_patch_remat();
+    # Use monkey patch to add remat for all transformer layers.
+    from transformers.models.opt.modeling_flax_opt import FlaxOPTDecoderLayer, FlaxOPTDecoderLayerCollection
+    from flax import linen as nn
+    from flax.linen.module import wrap_method_once
+
+    @wrap_method_once
+    def setup(self):
+        self.layers = [
+            nn.remat(FlaxOPTDecoderLayer, concrete=True)(
+                self.config, name=str(i), dtype=self.dtype)
+            for i in range(self.config.num_hidden_layers)
+        ]
+        self.layerdrop = self.config.layerdrop
+
+    setattr(FlaxOPTDecoderLayerCollection, "setup", setup)
 
 
 if __name__ == "__main__":
